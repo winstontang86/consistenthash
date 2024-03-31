@@ -7,7 +7,7 @@ import (
 
 func TestHashRing(t *testing.T) {
 	// 创建一个新的 HashRing
-	ring := New(100, nil, nil)
+	ring := New(100, nil)
 
 	// 添加节点
 	err := ring.Add("node1", "node2", "node3")
@@ -46,7 +46,7 @@ func TestHashRing(t *testing.T) {
 	t.Logf("Node for key1 after resetting nodes: %s", node)
 
 	// 重置所有节点
-	err = ring.ResetAll(200, crc32.ChecksumIEEE, crc32.ChecksumIEEE, "node1", "node2", "node3")
+	err = ring.ResetAll(200, crc32.ChecksumIEEE, "node1", "node2", "node3")
 	if err != nil {
 		t.Errorf("ResetAll nodes failed: %v", err)
 	}

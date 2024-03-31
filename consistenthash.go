@@ -22,19 +22,27 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"math"
 	"sort"
 	"strconv"
 	"sync"
 )
 
-var (
-	limitVNodes    = 0x1 << 30
-	ErrEmptyRing   = errors.New("empty hashring")
-	ErrHashRepeat  = errors.New("hashe repeat")
-	ErrTooManyNode = errors.New("too many nodes")
+const (
+	limitVNodes            = 0x1 << 30
+	defaultReplicas uint16 = 128
+	defaultCapacity        = 1024
 )
 
-// implement for sorting
+var (
+	// ErrRingEmpty "ring empty"
+	ErrRingEmpty = errors.New("ring empty")
+	// ErrRingFull "ring full"
+	ErrRingFull = errors.New("ring full")
+)
+
+// U32Slice implement for sorting
+// 实现sort.Interface接口的Uint32Slice
 type U32Slice []uint32
 
 // Len returns the length of the uints array.
@@ -46,42 +54,62 @@ func (x U32Slice) Less(i, j int) bool { return x[i] < x[j] }
 // Swap exchanges elements i and j.
 func (x U32Slice) Swap(i, j int) { x[i], x[j] = x[j], x[i] }
 
+// Hash32 func with uint32 return
+// 输出为uint32的hash函数
 type Hash32 func(data []byte) uint32
 
+// HashRing core struct for hashring
+// 一致性hash环的结构体
 type HashRing struct {
-	keyHash    Hash32            // hash for key. Usually the same as nodeHash
-	nodeHash   Hash32            // hash for node. Usually the same as keyHash
-	replicas   uint16            // number of virtual nodes per physical node
-	ring       map[uint32]string // hash ring
-	nodes      map[string]bool   // all physical nodes
-	nodeCount  int               // physical node count
-	vNodeHashs U32Slice          // Sorted virtual node hash32
+	HashFunc    Hash32            // hash func for key and for node
+	replicas    uint16            // number of virtual nodes per physical node
+	vNodes      U32Slice          // Sorted virtual node hash32
+	vnodeToNode map[uint32]string // hash ring
+	nodes       map[string]bool   // all physical nodes
+
 	sync.RWMutex
 }
 
-// New creates a new hash ring.
-func New(replicas uint16, keyFn, nodeFn Hash32) *HashRing {
+// New creates a new hash ring. With default hash function crc32.
+// 创建hash环，默认hash函数为crc32.ChecksumIEEE
+func New(replicas uint16, hash Hash32) *HashRing {
 	m := &HashRing{
-		keyHash:    keyFn,
-		nodeHash:   nodeFn,
-		replicas:   replicas,
-		ring:       make(map[uint32]string),
-		nodes:      make(map[string]bool),
-		nodeCount:  0,
-		vNodeHashs: make([]uint32, 0),
+		HashFunc:    hash,
+		replicas:    replicas,
+		vNodes:      make([]uint32, 0, defaultCapacity),
+		vnodeToNode: make(map[uint32]string),
+		nodes:       make(map[string]bool),
 	}
-	if m.keyHash == nil {
-		m.keyHash = crc32.ChecksumIEEE
+	// 强制修正错误输入
+	if m.replicas == 0 {
+		m.replicas = defaultReplicas
 	}
-	if m.nodeHash == nil {
-		m.nodeHash = crc32.ChecksumIEEE
+	if m.HashFunc == nil {
+		m.HashFunc = crc32.ChecksumIEEE
 	}
 	return m
 }
 
-// IsEmpty returns true if there are no nodes available.
+// numHash big uint32 to small uint32
+// 把大整数hash到一个小整数
+func numHash(key, max uint32) uint32 {
+	const prime uint32 = 16777619
+	// 乘法有可能溢出导致环绕，但不影响逻辑
+	return (key * prime) % max
+}
+
+// combKey generates a string key for an vnode with an index.
+// 字符串和index组合成一个key
+func combKey(node string, idx int) string {
+	return strconv.Itoa(idx) + node
+}
+
+// IsEmpty 是否空
 func (m *HashRing) IsEmpty() bool {
-	return len(m.ring) == 0
+	m.RLock()
+	defer m.RUnlock()
+
+	return len(m.vnodeToNode) == 0
 }
 
 // RingInfo information about the hash ring.
@@ -89,102 +117,117 @@ func (m *HashRing) RingInfo() string {
 	m.RLock()
 	defer m.RUnlock()
 
-	s := "HashRing: \n"
-	for k, v := range m.ring {
+	s := "HashRing: vnode count = " + strconv.Itoa(len(m.vnodeToNode)) +
+		" node count = , " + strconv.Itoa(len(m.nodes)) + " detail info \n"
+	for k, v := range m.vnodeToNode {
 		s += fmt.Sprintf("%d: %s, ", k, v)
 	}
 	return s
 }
 
 // Add adds some nodes to the hashring.
-// If return error，MUST reset hashring!
+// If return error，MUST ResetAll hashring, typically by adjusting the replicas!
+// 返回错误，必须接收和处理
 func (m *HashRing) Add(nodes ...string) error {
 	m.Lock()
 	defer m.Unlock()
-	//too much nodes, return error
-	if (m.nodeCount+len(nodes))*int(m.replicas) > limitVNodes {
-		return ErrTooManyNode
+	// too much nodes, return error
+	if (len(m.nodes)+len(nodes))*int(m.replicas) > limitVNodes {
+		return ErrRingFull
 	}
 	m.add(nodes...)
-	// recheck
-	if m.nodeCount*int(m.replicas) != len(m.ring) {
-		return ErrHashRepeat
-	}
 	return nil
 }
 
-// need Lock() before calling
+// add need Lock() before called
 func (m *HashRing) add(nodes ...string) {
+	segmentLen := uint32(math.MaxUint32 / int(m.replicas))
 	for _, node := range nodes {
-		// ignored duplicate nodes
+		// Ignored duplicate node
 		if _, ok := m.nodes[node]; ok {
 			continue
 		}
-		for i := 0; i < int(m.replicas); i++ {
-			vhash := m.nodeHash([]byte(m.nodeVKey(node, i)))
-			m.ring[vhash] = node
-			m.vNodeHashs = append(m.vNodeHashs, vhash)
+		// add vitual nodes
+		var ui uint16 = 0
+		for ; ui < m.replicas; ui++ {
+			segmentStart := segmentLen * uint32(ui)
+			vhash32 := m.HashFunc([]byte(combKey(node, int(ui))))
+			segmentIdx := numHash(vhash32, segmentLen)
+			vhash32 = segmentStart + segmentIdx
+			// 检查是否有hash冲突，有冲突重hash两次
+			if _, ok := m.vnodeToNode[vhash32]; ok {
+				segmentIdx = numHash(vhash32+1, segmentLen)
+				vhash32 = segmentStart + segmentIdx
+				if _, ok := m.vnodeToNode[vhash32]; ok {
+					segmentIdx = numHash(vhash32+1, segmentLen)
+					vhash32 = segmentStart + segmentIdx
+					if _, ok := m.vnodeToNode[vhash32]; ok {
+						// 如果还是冲突则直接跳过，逻辑无影响，稍微对均衡性有影响
+						continue
+					}
+				}
+			}
+			m.vnodeToNode[vhash32] = node
+			m.vNodes = append(m.vNodes, vhash32)
 		}
+		// Add physical node
 		m.nodes[node] = true
-		m.nodeCount++
 	}
-	sort.Sort(m.vNodeHashs)
-}
-
-// nodeVKey generates a string key for an vnode with an index.
-func (m *HashRing) nodeVKey(node string, idx int) string {
-	return strconv.Itoa(idx) + node
+	sort.Sort(m.vNodes)
 }
 
 // Remove removes some nodes from the hash.
+// 删除节点
 func (m *HashRing) Remove(node string) {
 	m.Lock()
 	defer m.Unlock()
 	m.remove(node)
 }
 
-// need Lock() before calling
+// remove need Lock() before calling
 func (m *HashRing) remove(nodes ...string) {
 	for _, node := range nodes {
 		// 检查是否存在，不存在则跳过
 		if _, ok := m.nodes[node]; !ok {
 			continue
 		}
-		for i := 0; i < int(m.replicas); i++ {
-			vhash := m.nodeHash([]byte(m.nodeVKey(node, i)))
-			delete(m.ring, vhash)
+		// 删除虚拟节点和映射关系
+		for k, v := range m.vnodeToNode {
+			if v == node {
+				delete(m.vnodeToNode, k)
+			}
 		}
-		delete(m.nodes, node) //m.nodes[node] = false
-		m.nodeCount--
+		delete(m.nodes, node)
 	}
 	m.rebuildVNodeSlice()
 }
 
-// rebuildVNodeSlice
-// need Lock() before calling
+// rebuildVNodeSlice 重建虚拟节点切片
+// need Lock() before called
 func (m *HashRing) rebuildVNodeSlice() {
-	// 理论上节点的删除是一个小概率事件，所以这里暂不对内存做优化
-	m.vNodeHashs = make([]uint32, 0)
-	for k := range m.ring {
-		m.vNodeHashs = append(m.vNodeHashs, k)
+	// 直接复用现有内存，不新开辟内存
+	m.vNodes = m.vNodes[0:0]
+	for k := range m.vnodeToNode {
+		m.vNodes = append(m.vNodes, k)
 	}
-	sort.Sort(m.vNodeHashs)
+	sort.Sort(m.vNodes)
 }
 
 // Reset reset nodes
-// 如果返回了error，则需要resetall，特别是hash函数
-func (m *HashRing) Reset(nodes ...string) error {
+// If return error，MUST ResetAll hashring, typically by adjusting the replicas!
+// 返回错误，必须接收和处理
+func (m *HashRing) Reset(resetNodes ...string) error {
 	m.Lock()
 	defer m.Unlock()
-	if len(nodes)*int(m.replicas) > limitVNodes {
-		return ErrTooManyNode
+	if len(resetNodes)*int(m.replicas) > limitVNodes {
+		return ErrRingFull
 	}
 	// 对于环上的每一个，看是否在reset列表里面——删除
 	delNodes := make([]string, 0)
 	for ringNode := range m.nodes {
 		found := false
-		for _, node := range nodes {
-			if ringNode == node {
+		for _, resetNode := range resetNodes {
+			if ringNode == resetNode {
 				found = true
 				break
 			}
@@ -196,7 +239,7 @@ func (m *HashRing) Reset(nodes ...string) error {
 	m.remove(delNodes...)
 	// 对于reset列表里面的，看是否在环上——添加
 	addNodes := make([]string, 0)
-	for _, node := range nodes {
+	for _, node := range resetNodes {
 		_, exists := m.nodes[node]
 		if exists {
 			continue
@@ -205,64 +248,59 @@ func (m *HashRing) Reset(nodes ...string) error {
 		}
 	}
 	m.add(addNodes...)
-	// 检查是否有hash重复的虚拟节点
-	if m.nodeCount*int(m.replicas) != len(m.ring) {
-		return ErrHashRepeat
-	}
+
 	return nil
 }
 
-// need Lock() before calling
+// clear clear hashring
+// need Lock() before called
 func (m *HashRing) clear() {
-	m.nodeHash = nil
-	m.keyHash = nil
-	m.replicas = 100
-	m.ring = make(map[uint32]string)
+	m.HashFunc = crc32.ChecksumIEEE
+	m.replicas = defaultReplicas
+	m.vNodes = make([]uint32, 0, defaultCapacity)
+	m.vnodeToNode = make(map[uint32]string)
 	m.nodes = make(map[string]bool)
-	m.nodeCount = 0
-	m.vNodeHashs = make([]uint32, 0)
 }
 
-// ResetAll
-func (m *HashRing) ResetAll(replicas uint16, keyFn, nodeFn Hash32, nodes ...string) error {
+// ResetAll 重置
+func (m *HashRing) ResetAll(replicas uint16, hash Hash32, nodes ...string) error {
 	m.Lock()
 	defer m.Unlock()
 	// clear and reset hash functions
 	m.clear()
-	m.replicas = replicas
-	m.keyHash = keyFn
-	m.nodeHash = nodeFn
-	if m.keyHash == nil {
-		m.keyHash = crc32.ChecksumIEEE
+	if replicas > 0 {
+		m.replicas = replicas
 	}
-	if m.nodeHash == nil {
-		m.nodeHash = crc32.ChecksumIEEE
+	if m.HashFunc != nil {
+		m.HashFunc = hash
 	}
-	//too much nodes, return error
-	if (m.nodeCount+len(nodes))*int(m.replicas) > limitVNodes {
-		return ErrTooManyNode
+	// too much nodes, return error
+	if len(nodes)*int(m.replicas) > limitVNodes {
+		return ErrRingFull
 	}
 	m.add(nodes...)
-	// 检查是否有hash重复的虚拟节点
-	if m.nodeCount*int(m.replicas) != len(m.ring) {
-		return ErrHashRepeat
-	}
+
 	return nil
 }
 
 // Get gets the closest node in the hashring to the provided key.
+// 获取key对应的节点
 func (m *HashRing) Get(key string) (string, error) {
-	if m.IsEmpty() {
-		return "", ErrEmptyRing
+	m.RLock()
+	defer m.RUnlock()
+
+	if len(m.vnodeToNode) == 0 {
+		return "", ErrRingEmpty
 	}
-	hash := m.keyHash([]byte(key))
+
+	u32Hash := m.HashFunc([]byte(key))
 	// Binary search for appropriate replica.
-	idx := sort.Search(len(m.vNodeHashs), func(i int) bool { return m.vNodeHashs[i] >= hash })
+	idx := sort.Search(len(m.vNodes), func(i int) bool { return m.vNodes[i] >= u32Hash })
 
 	// Attention
-	if idx == len(m.vNodeHashs) {
+	if idx == len(m.vNodes) {
 		idx = 0
 	}
 
-	return m.ring[m.vNodeHashs[idx]], nil
+	return m.vnodeToNode[m.vNodes[idx]], nil
 }
