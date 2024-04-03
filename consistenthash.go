@@ -30,8 +30,9 @@ import (
 
 const (
 	limitVNodes            = 0x1 << 30
+	miniReplicas    uint16 = 2
 	defaultReplicas uint16 = 128
-	defaultCapacity        = 1024
+	defaultCapacity        = 2048
 )
 
 var (
@@ -54,6 +55,9 @@ func (x U32Slice) Less(i, j int) bool { return x[i] < x[j] }
 // Swap exchanges elements i and j.
 func (x U32Slice) Swap(i, j int) { x[i], x[j] = x[j], x[i] }
 
+// NodeSet is a set of nodes.
+type NodeSet map[string]struct{}
+
 // Hash32 func with uint32 return
 // 输出为uint32的hash函数
 type Hash32 func(data []byte) uint32
@@ -61,11 +65,11 @@ type Hash32 func(data []byte) uint32
 // HashRing core struct for hashring
 // 一致性hash环的结构体
 type HashRing struct {
-	HashFunc    Hash32            // hash func for key and for node
-	replicas    uint16            // number of virtual nodes per physical node
-	vNodes      U32Slice          // Sorted virtual node hash32
-	vnodeToNode map[uint32]string // hash ring
-	nodes       map[string]bool   // all physical nodes
+	HashFunc    Hash32              // hash func for key and for node
+	replicas    uint16              // virtual nodes per physical, MUST greater than 2
+	vNodes      U32Slice            // Sorted virtual node hash32
+	vnodeToNode map[uint32]string   // hash ring
+	nodeToVnode map[string]U32Slice // all physical nodes. Slice for delete performence
 
 	sync.RWMutex
 }
@@ -73,15 +77,19 @@ type HashRing struct {
 // New creates a new hash ring. With default hash function crc32.
 // 创建hash环，默认hash函数为crc32.ChecksumIEEE
 func New(replicas uint16, hash Hash32) *HashRing {
+	hintCap := defaultCapacity
+	if int(replicas) > hintCap {
+		hintCap = int(replicas)
+	}
 	m := &HashRing{
 		HashFunc:    hash,
 		replicas:    replicas,
-		vNodes:      make([]uint32, 0, defaultCapacity),
-		vnodeToNode: make(map[uint32]string),
-		nodes:       make(map[string]bool),
+		vNodes:      make([]uint32, 0, hintCap),
+		vnodeToNode: make(map[uint32]string, hintCap),
+		nodeToVnode: make(map[string]U32Slice, defaultCapacity/8),
 	}
 	// 强制修正错误输入
-	if m.replicas == 0 {
+	if m.replicas < miniReplicas {
 		m.replicas = defaultReplicas
 	}
 	if m.HashFunc == nil {
@@ -118,7 +126,7 @@ func (m *HashRing) RingInfo() string {
 	defer m.RUnlock()
 
 	s := "HashRing: vnode count = " + strconv.Itoa(len(m.vnodeToNode)) +
-		" node count = , " + strconv.Itoa(len(m.nodes)) + " detail info \n"
+		" node count = , " + strconv.Itoa(len(m.nodeToVnode)) + " detail info \n"
 	for k, v := range m.vnodeToNode {
 		s += fmt.Sprintf("%d: %s, ", k, v)
 	}
@@ -132,7 +140,7 @@ func (m *HashRing) Add(nodes ...string) error {
 	m.Lock()
 	defer m.Unlock()
 	// too much nodes, return error
-	if (len(m.nodes)+len(nodes))*int(m.replicas) > limitVNodes {
+	if len(m.vnodeToNode)+len(nodes)*int(m.replicas) > limitVNodes {
 		return ErrRingFull
 	}
 	m.add(nodes...)
@@ -141,12 +149,17 @@ func (m *HashRing) Add(nodes ...string) error {
 
 // add need Lock() before called
 func (m *HashRing) add(nodes ...string) {
+	if len(nodes) == 0 {
+		return
+	}
 	segmentLen := uint32(math.MaxUint32 / int(m.replicas))
 	for _, node := range nodes {
 		// Ignored duplicate node
-		if _, ok := m.nodes[node]; ok {
+		if _, ok := m.nodeToVnode[node]; ok {
 			continue
 		}
+		// Add physical node
+		m.nodeToVnode[node] = make(U32Slice, 0, m.replicas)
 		// add vitual nodes
 		var ui uint16 = 0
 		for ; ui < m.replicas; ui++ {
@@ -169,9 +182,8 @@ func (m *HashRing) add(nodes ...string) {
 			}
 			m.vnodeToNode[vhash32] = node
 			m.vNodes = append(m.vNodes, vhash32)
+			m.nodeToVnode[node] = append(m.nodeToVnode[node], vhash32)
 		}
-		// Add physical node
-		m.nodes[node] = true
 	}
 	sort.Sort(m.vNodes)
 }
@@ -181,69 +193,64 @@ func (m *HashRing) add(nodes ...string) {
 func (m *HashRing) Remove(node string) {
 	m.Lock()
 	defer m.Unlock()
-	m.remove(node)
+	m.remove(true, node)
 }
 
 // remove need Lock() before calling
-func (m *HashRing) remove(nodes ...string) {
+// The bSort should NOT be false unless you know what happened.
+func (m *HashRing) remove(bSort bool, nodes ...string) {
+	if len(nodes) == 0 {
+		return
+	}
 	for _, node := range nodes {
 		// 检查是否存在，不存在则跳过
-		if _, ok := m.nodes[node]; !ok {
+		if _, ok := m.nodeToVnode[node]; !ok {
 			continue
 		}
 		// 删除虚拟节点和映射关系
-		for k, v := range m.vnodeToNode {
-			if v == node {
-				delete(m.vnodeToNode, k)
-			}
+		for _, vhash32 := range m.nodeToVnode[node] {
+			delete(m.vnodeToNode, vhash32)
 		}
-		delete(m.nodes, node)
+		delete(m.nodeToVnode, node)
 	}
-	m.rebuildVNodeSlice()
+	m.rebuildVNodeSlice(bSort)
 }
 
 // rebuildVNodeSlice 重建虚拟节点切片
-// need Lock() before called
-func (m *HashRing) rebuildVNodeSlice() {
+// need Lock() before called, bSort usually true
+func (m *HashRing) rebuildVNodeSlice(bSort bool) {
 	// 直接复用现有内存，不新开辟内存
 	m.vNodes = m.vNodes[0:0]
 	for k := range m.vnodeToNode {
 		m.vNodes = append(m.vNodes, k)
 	}
-	sort.Sort(m.vNodes)
+	if bSort {
+		sort.Sort(m.vNodes)
+	}
 }
 
 // Reset reset nodes
 // If return error，MUST ResetAll hashring, typically by adjusting the replicas!
 // 返回错误，必须接收和处理
-func (m *HashRing) Reset(resetNodes ...string) error {
+func (m *HashRing) Reset(resetNodes NodeSet) error {
 	m.Lock()
 	defer m.Unlock()
 	if len(resetNodes)*int(m.replicas) > limitVNodes {
 		return ErrRingFull
 	}
-	// 对于环上的每一个，看是否在reset列表里面——删除
+	// 遍历物理节点，看是否在reset列表里面，不在的删除
 	delNodes := make([]string, 0)
-	for ringNode := range m.nodes {
-		found := false
-		for _, resetNode := range resetNodes {
-			if ringNode == resetNode {
-				found = true
-				break
-			}
-		}
-		if !found {
+	for ringNode := range m.nodeToVnode {
+		if _, exists := resetNodes[ringNode]; !exists {
 			delNodes = append(delNodes, ringNode)
 		}
 	}
-	m.remove(delNodes...)
-	// 对于reset列表里面的，看是否在环上——添加
+	// add里面有sort，所以remove里面不需要sort
+	m.remove(false, delNodes...)
+	// 对于reset列表里面的，看是否在环上，不在的添加
 	addNodes := make([]string, 0)
-	for _, node := range resetNodes {
-		_, exists := m.nodes[node]
-		if exists {
-			continue
-		} else {
+	for node := range resetNodes {
+		if _, exists := m.nodeToVnode[node]; !exists {
 			addNodes = append(addNodes, node)
 		}
 	}
@@ -258,8 +265,8 @@ func (m *HashRing) clear() {
 	m.HashFunc = crc32.ChecksumIEEE
 	m.replicas = defaultReplicas
 	m.vNodes = make([]uint32, 0, defaultCapacity)
-	m.vnodeToNode = make(map[uint32]string)
-	m.nodes = make(map[string]bool)
+	m.vnodeToNode = make(map[uint32]string, defaultCapacity)
+	m.nodeToVnode = make(map[string]U32Slice, defaultCapacity/8)
 }
 
 // ResetAll 重置
@@ -268,7 +275,7 @@ func (m *HashRing) ResetAll(replicas uint16, hash Hash32, nodes ...string) error
 	defer m.Unlock()
 	// clear and reset hash functions
 	m.clear()
-	if replicas > 0 {
+	if replicas >= miniReplicas {
 		m.replicas = replicas
 	}
 	if m.HashFunc != nil {
