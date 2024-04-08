@@ -69,6 +69,9 @@ func TestHashRing(t *testing.T) {
 		t.Errorf("Get node failed: %v", err)
 	}
 	t.Logf("Node for key1 after resetting all nodes: %s", node)
+
+	// 测试 RingInfo 方法
+	t.Logf("RingInfo: %s", ring.RingInfo())
 }
 
 const (
@@ -160,5 +163,29 @@ func BenchmarkResetAll(b *testing.B) {
 		if err != nil {
 			b.Errorf("Error resetting nodes: %v", err)
 		}
+	}
+}
+
+func BenchmarkRingInfo(b *testing.B) {
+	ringInfo := ""
+	hashRing := New(100, nil)
+
+	// 添加初始节点
+	nodes := make([]string, numNodes)
+	i := 0
+	for ; i < numNodes; i++ {
+		key := "node" + strconv.Itoa(i)
+		nodes = append(nodes, key)
+	}
+	err := hashRing.Add(nodes...)
+	if err != nil {
+		b.Errorf("Error add nodes: %v", err)
+	}
+	// 测试主循环
+	for ti := 0; ti < b.N; ti++ {
+		ringInfo = hashRing.RingInfo()
+	}
+	if err != nil {
+		b.Errorf("RingInfo: %s", ringInfo)
 	}
 }

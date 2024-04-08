@@ -20,7 +20,6 @@ package consistenthash
 
 import (
 	"errors"
-	"fmt"
 	"hash/crc32"
 	"math"
 	"sort"
@@ -34,7 +33,7 @@ const (
 	miniReplicas    uint16 = 2
 	defaultReplicas uint16 = 128
 	// init capacity for virtual node
-	initVnodeCap = 2048
+	initVNodeCap = 2048
 	// init capacity for physical node
 	initPNodeCap = 16 // 2048 / 128 = 16
 )
@@ -81,7 +80,7 @@ type HashRing struct {
 // New creates a new hash ring. With default hash function crc32.
 // 创建hash环，默认hash函数为crc32.ChecksumIEEE
 func New(replicas uint16, hash Hash32) *HashRing {
-	hintCap := initVnodeCap
+	hintCap := initVNodeCap
 	if int(replicas) > hintCap {
 		hintCap = int(replicas)
 	}
@@ -131,10 +130,8 @@ func (m *HashRing) RingInfo() string {
 	defer m.RUnlock()
 
 	s := "HashRing: vnode count = " + strconv.Itoa(len(m.vnodeToNode)) +
-		" node count = , " + strconv.Itoa(len(m.nodeToVnode)) + " detail info \n"
-	for k, v := range m.vnodeToNode {
-		s += fmt.Sprintf("%d: %s, ", k, v)
-	}
+		" node count = , " + strconv.Itoa(len(m.nodeToVnode))
+
 	return s
 }
 
@@ -277,8 +274,8 @@ func (m *HashRing) Reset(resetNodes NodeSet) error {
 func (m *HashRing) clear() {
 	m.HashFunc = crc32.ChecksumIEEE
 	m.replicas = defaultReplicas
-	m.vNodes = make([]uint32, 0, initVnodeCap)
-	m.vnodeToNode = make(map[uint32]string, initVnodeCap)
+	m.vNodes = make([]uint32, 0, initVNodeCap)
+	m.vnodeToNode = make(map[uint32]string, initVNodeCap)
 	m.nodeToVnode = make(map[string]U32Slice, initPNodeCap)
 }
 
