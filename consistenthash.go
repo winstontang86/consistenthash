@@ -148,12 +148,13 @@ func (m *HashRing) Add(nodes ...string) error {
 	if len(m.vnodeToNode)+len(nodes)*int(m.replicas) > limitVNodes {
 		return ErrRingFull
 	}
-	m.add(nodes...)
+	m.add(true, nodes...)
 	return nil
 }
 
-// add need Lock() before called
-func (m *HashRing) add(nodes ...string) {
+// add MUST Lock() before called
+// The doSort CANNOT be false, unless you are SURE DO THE SORT.
+func (m *HashRing) add(doSort bool, nodes ...string) {
 	if len(nodes) == 0 {
 		return
 	}
@@ -190,7 +191,9 @@ func (m *HashRing) add(nodes ...string) {
 			m.nodeToVnode[node] = append(m.nodeToVnode[node], vhash32)
 		}
 	}
-	sort.Sort(m.vNodes)
+	if doSort {
+		sort.Sort(m.vNodes)
+	}
 }
 
 // Remove removes some nodes from the hash.
@@ -201,9 +204,9 @@ func (m *HashRing) Remove(node string) {
 	m.remove(true, node)
 }
 
-// remove need Lock() before calling
-// The bSort should NOT be false unless you know what happened.
-func (m *HashRing) remove(bSort bool, nodes ...string) {
+// remove MUST Lock() before calling
+// The doSort CANNOT be false, unless you are SURE DO THE SORT.
+func (m *HashRing) remove(doSort bool, nodes ...string) {
 	if len(nodes) == 0 {
 		return
 	}
@@ -218,18 +221,18 @@ func (m *HashRing) remove(bSort bool, nodes ...string) {
 		}
 		delete(m.nodeToVnode, node)
 	}
-	m.rebuildVNodeSlice(bSort)
+	m.rebuildVNodeSlice(doSort)
 }
 
 // rebuildVNodeSlice 重建虚拟节点切片
-// need Lock() before called, bSort usually true
-func (m *HashRing) rebuildVNodeSlice(bSort bool) {
+// MUST Lock() before called, doSort usually true
+func (m *HashRing) rebuildVNodeSlice(doSort bool) {
 	// 直接复用现有内存，不新开辟内存
 	m.vNodes = m.vNodes[0:0]
 	for k := range m.vnodeToNode {
 		m.vNodes = append(m.vNodes, k)
 	}
-	if bSort {
+	if doSort {
 		sort.Sort(m.vNodes)
 	}
 }
@@ -250,7 +253,7 @@ func (m *HashRing) Reset(resetNodes NodeSet) error {
 			delNodes = append(delNodes, ringNode)
 		}
 	}
-	// add里面有sort，所以remove里面不需要sort
+	// 只做一次排序，所以remove和add里面不排序
 	m.remove(false, delNodes...)
 	// 对于reset列表里面的，看是否在环上，不在的添加
 	addNodes := make([]string, 0)
@@ -259,13 +262,18 @@ func (m *HashRing) Reset(resetNodes NodeSet) error {
 			addNodes = append(addNodes, node)
 		}
 	}
-	m.add(addNodes...)
+	// 只做一次排序，所以remove和add里面不排序
+	m.add(false, addNodes...)
+	// MUST DO sort
+	if len(delNodes) > 0 || len(addNodes) > 0 {
+		sort.Sort(m.vNodes)
+	}
 
 	return nil
 }
 
 // clear clear hashring
-// need Lock() before called
+// MUST Lock() before called
 func (m *HashRing) clear() {
 	m.HashFunc = crc32.ChecksumIEEE
 	m.replicas = defaultReplicas
@@ -290,7 +298,7 @@ func (m *HashRing) ResetAll(replicas uint16, hash Hash32, nodes ...string) error
 	if len(nodes)*int(m.replicas) > limitVNodes {
 		return ErrRingFull
 	}
-	m.add(nodes...)
+	m.add(true, nodes...)
 
 	return nil
 }
