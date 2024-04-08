@@ -29,10 +29,14 @@ import (
 )
 
 const (
+	// virtual node count limit
 	limitVNodes            = 0x1 << 30
 	miniReplicas    uint16 = 2
 	defaultReplicas uint16 = 128
-	defaultCapacity        = 2048
+	// init capacity for virtual node
+	initVnodeCap = 2048
+	// init capacity for physical node
+	initPNodeCap = 16 // 2048 / 128 = 16
 )
 
 var (
@@ -77,16 +81,17 @@ type HashRing struct {
 // New creates a new hash ring. With default hash function crc32.
 // 创建hash环，默认hash函数为crc32.ChecksumIEEE
 func New(replicas uint16, hash Hash32) *HashRing {
-	hintCap := defaultCapacity
+	hintCap := initVnodeCap
 	if int(replicas) > hintCap {
 		hintCap = int(replicas)
 	}
+
 	m := &HashRing{
 		HashFunc:    hash,
 		replicas:    replicas,
 		vNodes:      make([]uint32, 0, hintCap),
 		vnodeToNode: make(map[uint32]string, hintCap),
-		nodeToVnode: make(map[string]U32Slice, defaultCapacity/8),
+		nodeToVnode: make(map[string]U32Slice, initPNodeCap),
 	}
 	// 强制修正错误输入
 	if m.replicas < miniReplicas {
@@ -264,9 +269,9 @@ func (m *HashRing) Reset(resetNodes NodeSet) error {
 func (m *HashRing) clear() {
 	m.HashFunc = crc32.ChecksumIEEE
 	m.replicas = defaultReplicas
-	m.vNodes = make([]uint32, 0, defaultCapacity)
-	m.vnodeToNode = make(map[uint32]string, defaultCapacity)
-	m.nodeToVnode = make(map[string]U32Slice, defaultCapacity/8)
+	m.vNodes = make([]uint32, 0, initVnodeCap)
+	m.vnodeToNode = make(map[uint32]string, initVnodeCap)
+	m.nodeToVnode = make(map[string]U32Slice, initPNodeCap)
 }
 
 // ResetAll 重置
@@ -278,7 +283,7 @@ func (m *HashRing) ResetAll(replicas uint16, hash Hash32, nodes ...string) error
 	if replicas >= miniReplicas {
 		m.replicas = replicas
 	}
-	if m.HashFunc != nil {
+	if hash != nil {
 		m.HashFunc = hash
 	}
 	// too much nodes, return error
