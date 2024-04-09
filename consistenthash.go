@@ -58,9 +58,6 @@ func (x U32Slice) Less(i, j int) bool { return x[i] < x[j] }
 // Swap exchanges elements i and j.
 func (x U32Slice) Swap(i, j int) { x[i], x[j] = x[j], x[i] }
 
-// NodeSet is a set of nodes.
-type NodeSet map[string]struct{}
-
 // Hash32 func with uint32 return
 // 输出为uint32的hash函数
 type Hash32 func(data []byte) uint32
@@ -164,8 +161,7 @@ func (m *HashRing) add(doSort bool, nodes ...string) {
 		// Add physical node
 		m.nodeToVnode[node] = make(U32Slice, 0, m.replicas)
 		// add vitual nodes
-		var ui uint16 = 0
-		for ; ui < m.replicas; ui++ {
+		for ui := uint16(0); ui < m.replicas; ui++ {
 			segmentStart := segmentLen * uint32(ui)
 			vhash32 := m.HashFunc([]byte(combKey(node, int(ui))))
 			segmentIdx := numHash(vhash32, segmentLen)
@@ -195,10 +191,10 @@ func (m *HashRing) add(doSort bool, nodes ...string) {
 
 // Remove removes some nodes from the hash.
 // 删除节点
-func (m *HashRing) Remove(node string) {
+func (m *HashRing) Remove(nodes ...string) {
 	m.Lock()
 	defer m.Unlock()
-	m.remove(true, node)
+	m.remove(true, nodes...)
 }
 
 // remove MUST Lock() before calling
@@ -237,11 +233,15 @@ func (m *HashRing) rebuildVNodeSlice(doSort bool) {
 // Reset reset nodes
 // If return error，MUST ResetAll hashring, typically by adjusting the replicas!
 // 返回错误，必须接收和处理
-func (m *HashRing) Reset(resetNodes NodeSet) error {
+func (m *HashRing) Reset(nodes ...string) error {
 	m.Lock()
 	defer m.Unlock()
-	if len(resetNodes)*int(m.replicas) > limitVNodes {
+	if len(nodes)*int(m.replicas) > limitVNodes {
 		return ErrRingFull
+	}
+	resetNodes := make(map[string]struct{}, len(nodes))
+	for _, node := range nodes {
+		resetNodes[node] = struct{}{}
 	}
 	// 遍历物理节点，看是否在reset列表里面，不在的删除
 	delNodes := make([]string, 0)
